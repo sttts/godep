@@ -89,12 +89,13 @@ var (
 	pkgCache = make(map[string]*build.Package) // dir => *build.Package
 )
 
-// returns the package in dir either from a cache or by importing it and then caching it
-func fullPackageInDir(dir string) (*build.Package, error) {
+// returns the package path in the given base dir either from a cache or by importing it and then caching it
+func fullPackageInDir(base string, path string) (*build.Package, error) {
 	var err error
+	dir := filepath.Join(base, path)
 	pkg, ok := pkgCache[dir]
 	if !ok {
-		pkg, err = build.ImportDir(dir, build.FindOnly)
+		pkg, err = build.Import(path, base, build.FindOnly)
 		if pkg.Goroot {
 			pkg, err = build.ImportDir(pkg.Dir, 0)
 		} else {
@@ -111,11 +112,12 @@ func fullPackageInDir(dir string) (*build.Package, error) {
 func listPackage(path string) (*Package, error) {
 	debugln("listPackage", path)
 	var lp *build.Package
-	dir, err := findDirForPath(path, nil)
+	base, err := findDirForPath(path, nil)
 	if err != nil {
 		return nil, err
 	}
-	lp, err = fullPackageInDir(dir)
+	dir := filepath.Join(base, path)
+	lp, err = fullPackageInDir(base, path)
 	p := &Package{
 		Dir:            lp.Dir,
 		Root:           lp.Root,
@@ -141,11 +143,11 @@ func listPackage(path string) (*Package, error) {
 		ip, i := ds.Next()
 
 		debugf("Processing import %s for %s\n", i, ip.Dir)
-		pdir, err := findDirForPath(i, ip)
+		pbase, err := findDirForPath(i, ip)
 		if err != nil {
 			return nil, err
 		}
-		dp, err := fullPackageInDir(pdir)
+		dp, err := fullPackageInDir(pbase, i)
 		if err != nil { // This really should happen in this context though
 			ppln(err)
 			return nil, errorMissingDep{i: i, dir: ip.Dir}
@@ -182,10 +184,11 @@ func addDependency(deps []build.Package, d *build.Package) []build.Package {
 	return append(deps, *d)
 }
 
-// finds the directory for the given import path in the context of the provided build.Package (if provided)
+// finds the directory for the given import path in the context of the provided build.Package (if provided).
+// The returned dir is the base dir of the search, i.e. _without_ path being appended.
 func findDirForPath(path string, ip *build.Package) (string, error) {
 	debugln("findDirForPath", path, ip)
-	var search []string
+	var bases []string
 
 	if build.IsLocalImport(path) {
 		dir := path
@@ -204,21 +207,20 @@ func findDirForPath(path string, ip *build.Package) (string, error) {
 		cr := cleanPath(ip.Root)
 
 		for base := cleanPath(ip.Dir); !pathEqual(base, cr); base = cleanPath(filepath.Dir(base)) {
-			s := filepath.Join(base, "vendor", path)
+			s := filepath.Join(base, "vendor")
 			debugln("Adding search dir:", s)
-			search = append(search, s)
+			bases = append(bases, s)
 		}
 	}
 
-	for _, base := range build.Default.SrcDirs() {
-		search = append(search, filepath.Join(base, path))
-	}
+	bases = append(bases, build.Default.SrcDirs()...)
 
-	for _, dir := range search {
+	for _, base := range bases {
+		dir := filepath.Join(base, path)
 		debugln("searching", dir)
 		fi, err := stat(dir)
 		if err == nil && fi.IsDir() {
-			return dir, nil
+			return base, nil
 		}
 	}
 
@@ -459,18 +461,18 @@ func matchPackages(pattern string) []string {
 		if pattern == "cmd" {
 			root += "cmd" + string(filepath.Separator)
 		}
-		filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || !fi.IsDir() || path == src {
+		filepath.Walk(root, func(dir string, fi os.FileInfo, err error) error {
+			if err != nil || !fi.IsDir() || dir == src {
 				return nil
 			}
 
 			// Avoid .foo, _foo, and testdata directory trees.
-			_, elem := filepath.Split(path)
+			_, elem := filepath.Split(dir)
 			if strings.HasPrefix(elem, ".") || strings.HasPrefix(elem, "_") || elem == "testdata" {
 				return filepath.SkipDir
 			}
 
-			name := filepath.ToSlash(path[len(src):])
+			name := filepath.ToSlash(dir[len(src):])
 			if pattern == "std" && (strings.Contains(name, ".") || name == "cmd") {
 				// The name "std" is only the standard library.
 				// If the name has a dot, assume it's a domain name for go get,
@@ -488,12 +490,10 @@ func matchPackages(pattern string) []string {
 				return nil
 			}
 
-			ap, err := filepath.Abs(path)
-			if err != nil {
-				return nil
-			}
-			if _, err = fullPackageInDir(ap); err != nil {
-				debugf("matchPackage(%q) ap=%q Error: %q\n", ap, pattern, err)
+			path := dir[len(root):]
+			base := root[0 : len(root)-1]
+			if _, err = fullPackageInDir(base, path); err != nil {
+				debugf("matchPackage(%q) base=%q path=%q Error: %q\n", base, path, pattern, err)
 				if _, noGo := err.(*build.NoGoError); noGo {
 					return nil
 				}
@@ -546,7 +546,7 @@ func matchPackagesInFS(pattern string) []string {
 	// is enough for now, since ... is usually at the
 	// end of a path.
 	i := strings.Index(pattern, "...")
-	dir, _ := pathpkg.Split(pattern[:i])
+	root, _ := pathpkg.Split(pattern[:i])
 
 	// pattern begins with ./ or ../.
 	// path.Clean will discard the ./ but not the ../.
@@ -559,11 +559,11 @@ func matchPackagesInFS(pattern string) []string {
 	match := matchPattern(pattern)
 
 	var pkgs []string
-	filepath.Walk(dir, func(path string, fi os.FileInfo, err error) error {
+	filepath.Walk(root, func(dir string, fi os.FileInfo, err error) error {
 		if err != nil || !fi.IsDir() {
 			return nil
 		}
-		if path == dir {
+		if dir == root {
 			// filepath.Walk starts at dir and recurses. For the recursive case,
 			// the path is the result of filepath.Join, which calls filepath.Clean.
 			// The initial case is not Cleaned, though, so we do this explicitly.
@@ -572,26 +572,24 @@ func matchPackagesInFS(pattern string) []string {
 			// "cd $GOROOT/src; go list ./io/..." would incorrectly skip the io
 			// package, because prepending the prefix "./" to the unclean path would
 			// result in "././io", and match("././io") returns false.
-			path = filepath.Clean(path)
+			dir = filepath.Clean(dir)
 		}
 
 		// Avoid .foo, _foo, and testdata directory trees, but do not avoid "." or "..".
-		_, elem := filepath.Split(path)
+		_, elem := filepath.Split(dir)
 		dot := strings.HasPrefix(elem, ".") && elem != "." && elem != ".."
 		if dot || strings.HasPrefix(elem, "_") || elem == "testdata" {
 			return filepath.SkipDir
 		}
 
-		name := prefix + filepath.ToSlash(path)
+		name := prefix + filepath.ToSlash(dir)
 		if !match(name) {
 			return nil
 		}
-		ap, err := filepath.Abs(path)
-		if err != nil {
-			return nil
-		}
-		if _, err = fullPackageInDir(ap); err != nil {
-			debugf("matchPackageInFS(%q) ap=%q Error: %q\n", ap, pattern, err)
+		path := dir[len(root):]
+		base := root[0 : len(root)-1]
+		if _, err = fullPackageInDir(base, path); err != nil {
+			debugf("matchPackageInFS(%q) base=%q path=%q Error: %q\n", base, path, pattern, err)
 			if _, noGo := err.(*build.NoGoError); !noGo {
 				log.Print(err)
 			}
